@@ -1,9 +1,595 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Deployed via GitDeploy</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WhatsApp Sticker Studio</title>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- React & ReactDOM -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+    
+    <!-- Babel for JSX -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+
+    <!-- FFmpeg WASM (Version 0.9.8 - Legacy version compatible with non-isolated environments) -->
+    <script src="https://unpkg.com/@ffmpeg/ffmpeg@0.9.8/dist/ffmpeg.min.js"></script>
+
+    <style>
+        /* Custom Scrollbar */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #1f2937; 
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #4b5563; 
+            border-radius: 4px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #6b7280; 
+        }
+
+        /* Checkerboard pattern for transparency */
+        .bg-checkerboard {
+            background-image: 
+                linear-gradient(45deg, #1f2937 25%, transparent 25%), 
+                linear-gradient(-45deg, #1f2937 25%, transparent 25%), 
+                linear-gradient(45deg, transparent 75%, #1f2937 75%), 
+                linear-gradient(-45deg, transparent 75%, #1f2937 75%);
+            background-size: 20px 20px;
+            background-position: 0 0, 0 10px, 10px -10px, -10px 0px;
+            background-color: #111827;
+        }
+
+        .range-thumb-custom::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 16px;
+            height: 16px;
+            background: #22c55e;
+            cursor: pointer;
+            border-radius: 50%;
+            border: 2px solid white;
+        }
+    </style>
 </head>
-<body style="background: #111; color: #fff; font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh;">
-    <h1>Hello World</h1>
+<body class="bg-gray-900 text-white min-h-screen font-sans">
+
+    <div id="root"></div>
+
+    <script type="text/babel">
+        // --- Polyfill for SharedArrayBuffer in non-isolated environments ---
+        if (!window.SharedArrayBuffer) {
+            window.SharedArrayBuffer = window.ArrayBuffer;
+        }
+
+        const { useState, useEffect, useRef, useCallback } = React;
+        // Using FFmpeg 0.9.8 global
+        const { createFFmpeg, fetchFile } = FFmpeg;
+
+        // --- Lucide Icons Components ---
+        const Icon = ({ name, size = 20, className }) => {
+            const iconName = name.replace(/-([a-z])/g, (g) => g[1].toUpperCase());
+            if (window.lucide && window.lucide.icons[iconName]) {
+                return <i data-lucide={name} className={className} style={{fontSize: size}}></i>;
+            }
+            return <span>{name}</span>;
+        };
+
+        // --- App Component ---
+        function App() {
+            // State
+            const [ffmpeg, setFfmpeg] = useState(null);
+            const [loaded, setLoaded] = useState(false);
+            const [mediaSrc, setMediaSrc] = useState(null);
+            const [mediaType, setMediaType] = useState(null); // 'video' | 'image'
+            const [processing, setProcessing] = useState(false);
+            const [log, setLog] = useState("Ready");
+            
+            // Edit State
+            const [crop, setCrop] = useState({ x: 0, y: 0, scale: 1 });
+            const [duration, setDuration] = useState({ start: 0, end: 5 }); // Default 5s
+            const [maxDuration, setMaxDuration] = useState(0);
+            const [textOverlay, setTextOverlay] = useState({ text: "", color: "#ffffff", size: 30, y: 80 });
+            const [generatedSticker, setGeneratedSticker] = useState(null);
+
+            // Refs
+            const videoRef = useRef(null);
+            const containerRef = useRef(null);
+            const fileInputRef = useRef(null);
+
+            // Initialize Icons
+            useEffect(() => {
+                if (window.lucide) window.lucide.createIcons();
+            });
+
+            // Initialize FFmpeg
+            useEffect(() => {
+                const load = async () => {
+                    try {
+                        // Explicitly using a core version compatible with 0.9.8
+                        const ffmpegInstance = createFFmpeg({ 
+                            log: true,
+                            corePath: 'https://unpkg.com/@ffmpeg/core@0.10.0/dist/ffmpeg-core.js'
+                        });
+                        
+                        ffmpegInstance.setLogger(({ message }) => {
+                            console.log(message);
+                            if(message.includes('frame=')) {
+                                setLog("Processing frames...");
+                            } else {
+                                setLog(message.length > 50 ? message.substring(0, 50) + "..." : message);
+                            }
+                        });
+
+                        await ffmpegInstance.load();
+                        setFfmpeg(ffmpegInstance);
+                        setLoaded(true);
+                    } catch (e) {
+                        console.error("FFmpeg load failed:", e);
+                        setLog("Error: Engine failed. If this persists, the browser environment may be too restrictive.");
+                    }
+                };
+                load();
+            }, []);
+
+            // Handle File Upload
+            const handleUpload = (file) => {
+                const url = URL.createObjectURL(file);
+                setMediaSrc(url);
+                setMediaType(file.type.startsWith('image') ? 'image' : 'video');
+                setGeneratedSticker(null);
+                setDuration({ start: 0, end: 5 });
+                setCrop({ x: 0, y: 0, scale: 1 });
+                // Reset text
+                setTextOverlay({ text: "", color: "#ffffff", size: 30, y: 80 });
+            };
+
+            const handleUrlImport = async (url) => {
+                setLog("Fetching URL...");
+                try {
+                    const response = await fetch(url);
+                    if (!response.ok) throw new Error("Failed to fetch");
+                    const blob = await response.blob();
+                    handleUpload(blob);
+                    setLog("URL Loaded");
+                } catch (e) {
+                    setLog("Error: CORS or Invalid URL");
+                    alert("Could not load URL due to CORS restrictions. Please download the file and upload it manually.");
+                }
+            };
+
+            const onVideoLoadedMetadata = () => {
+                if (videoRef.current) {
+                    setMaxDuration(videoRef.current.duration);
+                    // Default sticker length max 5s
+                    setDuration({ 
+                        start: 0, 
+                        end: Math.min(videoRef.current.duration, 5) 
+                    });
+                }
+            };
+
+            // --- sticker generation logic ---
+            const generateSticker = async () => {
+                if (!mediaSrc) return;
+                setProcessing(true);
+                setLog("Starting conversion...");
+
+                try {
+                    if (mediaType === 'video' && loaded) {
+                        await processVideoSticker();
+                    } else if (mediaType === 'image') {
+                        await processImageSticker();
+                    } else if (mediaType === 'video' && !loaded) {
+                        alert("Video processing engine not loaded. Please wait or use a static image.");
+                    }
+                } catch (error) {
+                    console.error(error);
+                    setLog("Error during generation");
+                }
+                setProcessing(false);
+            };
+
+            const processImageSticker = async () => {
+                // Static image processing via Canvas
+                const canvas = document.createElement('canvas');
+                canvas.width = 512;
+                canvas.height = 512;
+                const ctx = canvas.getContext('2d');
+                
+                const img = new Image();
+                img.crossOrigin = "anonymous";
+                img.src = mediaSrc;
+                await new Promise(r => img.onload = r);
+
+                // Draw background/transparency
+                // Calculate crop
+                const scale = crop.scale;
+                ctx.clearRect(0,0, 512, 512);
+
+                const aspect = img.width / img.height;
+                let drawW = 512;
+                let drawH = 512;
+                
+                if (aspect > 1) drawH = 512 / aspect;
+                else drawW = 512 * aspect;
+
+                const centerX = 256;
+                const centerY = 256;
+                
+                ctx.save();
+                ctx.translate(centerX, centerY);
+                ctx.scale(scale, scale); 
+                ctx.drawImage(img, -drawW/2, -drawH/2, drawW, drawH);
+                ctx.restore();
+
+                // Add Text
+                if (textOverlay.text) {
+                    ctx.font = `bold ${textOverlay.size}px sans-serif`;
+                    ctx.fillStyle = textOverlay.color;
+                    ctx.textAlign = "center";
+                    ctx.strokeStyle = "black";
+                    ctx.lineWidth = 3;
+                    ctx.strokeText(textOverlay.text, 256, (textOverlay.y / 100) * 512);
+                    ctx.fillText(textOverlay.text, 256, (textOverlay.y / 100) * 512);
+                }
+
+                setGeneratedSticker(canvas.toDataURL('image/webp'));
+                setLog("Sticker Created!");
+            };
+
+            const processVideoSticker = async () => {
+                if (!ffmpeg) return;
+
+                const inputName = 'input.mp4';
+                const outputName = 'output.webp';
+
+                // Write file to memory (0.9.8 syntax)
+                ffmpeg.FS('writeFile', inputName, await fetchFile(mediaSrc));
+
+                const dur = duration.end - duration.start;
+                if (dur > 7) {
+                    alert("WhatsApp stickers should be < 7 seconds. Trimming to safe limits.");
+                }
+
+                // Filter string
+                let filters = `fps=15,scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:-1:-1:color=0x00000000`;
+
+                // Run FFmpeg (0.9.8 syntax: run instead of exec)
+                await ffmpeg.run(
+                    '-ss', `${duration.start}`,
+                    '-to', `${duration.end}`,
+                    '-i', inputName,
+                    '-vf', filters,
+                    '-vcodec', 'libwebp',
+                    '-lossless', '0',
+                    '-compression_level', '4',
+                    '-q:v', '50', 
+                    '-loop', '0',
+                    '-an', 
+                    '-preset', 'default',
+                    outputName
+                );
+
+                // Read result (0.9.8 syntax)
+                const data = ffmpeg.FS('readFile', outputName);
+                const url = URL.createObjectURL(new Blob([data.buffer], { type: 'image/webp' }));
+                setGeneratedSticker(url);
+                setLog("Sticker Created!");
+            };
+
+            // --- UI Handlers ---
+
+            const handleDragOver = (e) => {
+                e.preventDefault();
+            };
+
+            const handleDrop = (e) => {
+                e.preventDefault();
+                if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+                    handleUpload(e.dataTransfer.files[0]);
+                }
+            };
+
+            return (
+                <div className="flex flex-col h-screen max-w-6xl mx-auto p-4 md:p-8">
+                    {/* Header */}
+                    <header className="flex items-center justify-between mb-8">
+                        <div className="flex items-center space-x-3">
+                            <div className="bg-green-500 p-2 rounded-lg">
+                                <i data-lucide="sticker" className="text-white w-8 h-8"></i>
+                            </div>
+                            <h1 className="text-2xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-green-400 to-emerald-600">
+                                Sticker Studio
+                            </h1>
+                        </div>
+                        <div className="text-xs text-gray-500 font-mono">
+                            {loaded ? "Engine: Ready" : "Engine: Loading..."}
+                        </div>
+                    </header>
+
+                    {/* Main Workspace */}
+                    <div className="flex-1 grid grid-cols-1 lg:grid-cols-2 gap-8 min-h-0">
+                        
+                        {/* LEFT: Preview & Import */}
+                        <div className="flex flex-col space-y-4">
+                            
+                            {/* Viewer Stage */}
+                            <div 
+                                className="relative w-full aspect-square bg-checkerboard rounded-xl border-2 border-gray-700 overflow-hidden shadow-2xl flex items-center justify-center group"
+                                onDragOver={handleDragOver}
+                                onDrop={handleDrop}
+                            >
+                                {!mediaSrc ? (
+                                    <div className="text-center p-8">
+                                        <i data-lucide="upload-cloud" className="w-16 h-16 mx-auto text-gray-600 mb-4 group-hover:text-green-500 transition-colors"></i>
+                                        <p className="text-gray-400 font-medium">Drag media here</p>
+                                        <p className="text-gray-600 text-sm mt-2">or paste URL below</p>
+                                    </div>
+                                ) : (
+                                    <>
+                                        {mediaType === 'video' ? (
+                                            <video 
+                                                ref={videoRef}
+                                                src={mediaSrc}
+                                                className="max-w-full max-h-full object-contain"
+                                                autoPlay
+                                                muted
+                                                loop
+                                                onLoadedMetadata={onVideoLoadedMetadata}
+                                                style={{
+                                                    transform: `scale(${crop.scale})`
+                                                }}
+                                            />
+                                        ) : (
+                                            <img 
+                                                src={mediaSrc} 
+                                                className="max-w-full max-h-full object-contain"
+                                                style={{
+                                                    transform: `scale(${crop.scale})`
+                                                }}
+                                            />
+                                        )}
+                                        
+                                        {/* Text Overlay Preview (Rough) */}
+                                        {textOverlay.text && (
+                                            <div 
+                                                className="absolute w-full text-center pointer-events-none drop-shadow-md"
+                                                style={{
+                                                    top: `${textOverlay.y}%`,
+                                                    color: textOverlay.color,
+                                                    fontSize: `${textOverlay.size}px`,
+                                                    fontWeight: 'bold',
+                                                    textShadow: '0px 0px 4px rgba(0,0,0,0.8)'
+                                                }}
+                                            >
+                                                {textOverlay.text}
+                                            </div>
+                                        )}
+                                        
+                                        {/* Crop Overlay Guide (512x512 ratio approximation) */}
+                                        <div className="absolute inset-0 border-2 border-green-500/30 pointer-events-none flex items-center justify-center">
+                                            <div className="w-full h-full border border-dashed border-white/20"></div>
+                                        </div>
+                                    </>
+                                )}
+                            </div>
+
+                            {/* Import Controls */}
+                            <div className="flex gap-2">
+                                <input 
+                                    type="file" 
+                                    className="hidden" 
+                                    ref={fileInputRef}
+                                    accept="image/*,video/*"
+                                    onChange={(e) => e.target.files[0] && handleUpload(e.target.files[0])}
+                                />
+                                <button 
+                                    onClick={() => fileInputRef.current.click()}
+                                    className="flex-1 bg-gray-800 hover:bg-gray-700 text-white py-3 rounded-lg font-medium transition flex items-center justify-center gap-2"
+                                >
+                                    <i data-lucide="file-image" className="w-4 h-4"></i>
+                                    Upload File
+                                </button>
+                                
+                                <div className="flex-[2] relative">
+                                    <input 
+                                        type="text" 
+                                        placeholder="Paste image/gif URL..." 
+                                        className="w-full bg-gray-800 border border-gray-700 text-white pl-10 pr-4 py-3 rounded-lg focus:outline-none focus:border-green-500"
+                                        onKeyDown={(e) => {
+                                            if (e.key === 'Enter') handleUrlImport(e.target.value);
+                                        }}
+                                    />
+                                    <i data-lucide="link" className="absolute left-3 top-3.5 text-gray-500 w-4 h-4"></i>
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* RIGHT: Editor Controls */}
+                        <div className="flex flex-col space-y-6 bg-gray-800/50 p-6 rounded-xl border border-gray-700">
+                            
+                            {/* Section: Timeline */}
+                            {mediaType === 'video' && (
+                                <div>
+                                    <div className="flex justify-between text-sm text-gray-400 mb-2">
+                                        <span>Trim Video (Max 7s)</span>
+                                        <span>{duration.start.toFixed(1)}s - {duration.end.toFixed(1)}s</span>
+                                    </div>
+                                    <div className="relative h-2 bg-gray-700 rounded-full mb-6">
+                                        {/* Progress Bar Background */}
+                                        <div 
+                                            className="absolute h-full bg-green-500/30 rounded-full"
+                                            style={{
+                                                left: `${(duration.start / maxDuration) * 100}%`,
+                                                right: `${100 - (duration.end / maxDuration) * 100}%`
+                                            }}
+                                        ></div>
+                                        {/* Inputs */}
+                                        <input 
+                                            type="range" 
+                                            min="0" 
+                                            max={maxDuration} 
+                                            step="0.1"
+                                            value={duration.start}
+                                            onChange={(e) => {
+                                                const val = parseFloat(e.target.value);
+                                                if (val < duration.end - 0.5) setDuration({...duration, start: val});
+                                            }}
+                                            className="absolute w-full h-full opacity-0 cursor-pointer z-10"
+                                        />
+                                        <input 
+                                            type="range" 
+                                            min="0" 
+                                            max={maxDuration} 
+                                            step="0.1"
+                                            value={duration.end}
+                                            onChange={(e) => {
+                                                const val = parseFloat(e.target.value);
+                                                if (val > duration.start + 0.5) setDuration({...duration, end: val});
+                                            }}
+                                            className="absolute w-full h-full opacity-0 cursor-pointer z-10"
+                                        />
+                                        {/* Thumbs Visuals (Approximation) */}
+                                        <div 
+                                            className="absolute w-4 h-4 bg-white rounded-full shadow border border-gray-300 top-1/2 transform -translate-y-1/2 pointer-events-none"
+                                            style={{ left: `${(duration.start / maxDuration) * 100}%` }}
+                                        ></div>
+                                        <div 
+                                            className="absolute w-4 h-4 bg-white rounded-full shadow border border-gray-300 top-1/2 transform -translate-y-1/2 pointer-events-none"
+                                            style={{ left: `${(duration.end / maxDuration) * 100}%` }}
+                                        ></div>
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* Section: Text */}
+                            <div>
+                                <label className="text-sm text-gray-400 mb-2 block">Caption</label>
+                                <input 
+                                    type="text" 
+                                    value={textOverlay.text}
+                                    onChange={(e) => setTextOverlay({...textOverlay, text: e.target.value})}
+                                    placeholder="Add text..."
+                                    className="w-full bg-gray-900 border border-gray-700 rounded-lg px-4 py-2 text-white focus:border-green-500 outline-none"
+                                />
+                                <div className="flex gap-4 mt-3">
+                                    <input 
+                                        type="color" 
+                                        value={textOverlay.color}
+                                        onChange={(e) => setTextOverlay({...textOverlay, color: e.target.value})}
+                                        className="h-10 w-10 rounded overflow-hidden cursor-pointer border-0 bg-transparent"
+                                    />
+                                    <div className="flex-1 flex flex-col justify-center">
+                                        <label className="text-xs text-gray-500">Size</label>
+                                        <input 
+                                            type="range" min="10" max="100" 
+                                            value={textOverlay.size}
+                                            onChange={(e) => setTextOverlay({...textOverlay, size: parseInt(e.target.value)})}
+                                            className="w-full h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer"
+                                        />
+                                    </div>
+                                    <div className="flex-1 flex flex-col justify-center">
+                                        <label className="text-xs text-gray-500">Position Y</label>
+                                        <input 
+                                            type="range" min="0" max="100" 
+                                            value={textOverlay.y}
+                                            onChange={(e) => setTextOverlay({...textOverlay, y: parseInt(e.target.value)})}
+                                            className="w-full h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer"
+                                        />
+                                    </div>
+                                </div>
+                            </div>
+
+                            {/* Section: Zoom/Crop */}
+                            <div>
+                                <label className="text-sm text-gray-400 mb-2 block">Zoom & Scale</label>
+                                <input 
+                                    type="range" min="0.5" max="3" step="0.1"
+                                    value={crop.scale}
+                                    onChange={(e) => setCrop({...crop, scale: parseFloat(e.target.value)})}
+                                    className="w-full h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer"
+                                />
+                            </div>
+
+                            <hr className="border-gray-700" />
+
+                            {/* Generate Button */}
+                            <button 
+                                onClick={generateSticker}
+                                disabled={processing || !mediaSrc}
+                                className={`w-full py-4 rounded-xl font-bold text-lg shadow-lg flex items-center justify-center gap-2 transition-all
+                                    ${processing || !mediaSrc 
+                                        ? 'bg-gray-700 text-gray-500 cursor-not-allowed' 
+                                        : 'bg-green-500 hover:bg-green-600 text-white hover:shadow-green-500/20'
+                                    }`}
+                            >
+                                {processing ? (
+                                    <>
+                                        <i data-lucide="loader-2" className="animate-spin"></i>
+                                        Processing...
+                                    </>
+                                ) : (
+                                    <>
+                                        <i data-lucide="wand-2"></i>
+                                        Make Sticker
+                                    </>
+                                )}
+                            </button>
+
+                            {/* Log Output */}
+                            <div className="text-xs font-mono text-gray-500 bg-black/30 p-2 rounded max-h-20 overflow-y-auto">
+                                > {log}
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Result Modal Overlay */}
+                    {generatedSticker && (
+                        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+                            <div className="bg-gray-800 p-6 rounded-2xl max-w-sm w-full shadow-2xl border border-gray-700 text-center">
+                                <h2 className="text-xl font-bold text-white mb-4">Sticker Ready!</h2>
+                                <div className="bg-checkerboard w-48 h-48 mx-auto rounded-lg overflow-hidden border border-gray-600 mb-6">
+                                    <img src={generatedSticker} className="w-full h-full object-contain" />
+                                </div>
+                                <div className="grid grid-cols-2 gap-3">
+                                    <a 
+                                        href={generatedSticker} 
+                                        download="sticker.webp"
+                                        className="bg-green-500 hover:bg-green-600 text-white py-2 rounded-lg font-medium transition flex items-center justify-center gap-2"
+                                    >
+                                        <i data-lucide="download"></i> Download
+                                    </a>
+                                    <button 
+                                        onClick={() => setGeneratedSticker(null)}
+                                        className="bg-gray-700 hover:bg-gray-600 text-white py-2 rounded-lg font-medium transition"
+                                    >
+                                        Close
+                                    </button>
+                                </div>
+                                <p className="text-xs text-gray-400 mt-4">
+                                    Format: WebP (512x512)<br/>
+                                    Compatible with WhatsApp Import
+                                </p>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
 </body>
 </html>
